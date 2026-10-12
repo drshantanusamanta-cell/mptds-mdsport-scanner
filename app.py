@@ -14,7 +14,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_sources import DataError, fetch_company, fetch_fy_prices
+from html import escape
+
+from data_sources import (
+    DataError, NotFoundError, fetch_company, fetch_fy_prices, looks_like_symbol, resolve_company,
+)
 from engine import (
     DE_LIMIT, MDSPORT_YEARS, MPTDS_MCAP_MIN, MPTDS_PARAMS, SENSITIVITY, SPORT_LABELS,
     VALID_ABOVE, WATCHLIST_FROM, evaluate_mdsport, evaluate_mptds, period_end,
@@ -100,6 +104,11 @@ html, body, [class*="css"], .stMarkdown, .stText {font-family:'Inter',system-ui,
 .legend span {padding:.22rem .6rem; border-radius:8px; color:#fff; font-size:.78rem; font-weight:600;}
 .note {border-left:4px solid #F59E0B; background:rgba(245,158,11,.10); border-radius:10px;
   padding:.55rem .8rem; font-size:.86rem; margin:.35rem 0;}
+.match {border-radius:12px; padding:.55rem .85rem; margin:.4rem 0 .2rem; font-size:.92rem;
+  background:linear-gradient(120deg,rgba(124,58,237,.12),rgba(13,148,136,.12));
+  border:1px solid rgba(124,58,237,.25);}
+.match .sym {display:inline-block; margin-left:.35rem; padding:.05rem .5rem; border-radius:999px;
+  background:#7C3AED; color:#fff; font-size:.78rem; font-weight:600; letter-spacing:.03em;}
 .section-title {font-family:'Poppins',sans-serif; font-size:clamp(1.05rem,2vw,1.3rem); font-weight:600; margin:.6rem 0 .2rem;}
 
 /* ---------- author card ---------- */
@@ -195,6 +204,11 @@ def load_company(symbol: str, basis: str):
     return fetch_company(symbol, basis)
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_matches(text: str):
+    return resolve_company(text)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_prices(symbol: str, labels: tuple[str, ...]):
     return fetch_fy_prices(symbol, list(labels))
@@ -254,8 +268,10 @@ def render_form() -> dict | None:
     with st.form("query_form"):
         c1, c2 = st.columns([1.6, 1])  # two rows of two: comfortable on tablets, stacks on phones
         c3, c4 = st.columns([1.6, 1])
-        symbol = c1.text_input("NSE symbol / BSE code", value=st.session_state.get("last_symbol", "TCS"),
-                               placeholder="e.g. TCS, INFY, ASIANPAINT").strip().upper()
+        symbol = c1.text_input("Company name or NSE symbol", value=st.session_state.get("last_symbol", "TCS"),
+                               placeholder="e.g. Shriram Finance, asian paints, TCS",
+                               help="Type a ticker (TCS, SHRIRAMFIN) or just the company's name — "
+                                    "names are looked up automatically.").strip()
         basis = c2.selectbox("Statements", ["Auto", "Consolidated", "Standalone"],
                              help="Auto = consolidated, falling back to standalone when consolidated is empty.")
         sens = c3.selectbox("MPTDS sensitivity", list(SENSITIVITY),
@@ -526,6 +542,36 @@ def render_footer() -> None:
     """)
 
 
+def find_company(text: str, basis: str):
+    """Ticker first; if that isn't a Screener page (or the text is a name), search by name."""
+    if looks_like_symbol(text):
+        try:
+            with st.spinner(f"Fetching filings for {text.upper()} from Screener.in…"):
+                return load_company(text.upper(), basis)
+        except NotFoundError:
+            pass  # e.g. "Shriram" — treat as a name
+
+    with st.spinner(f"Looking up “{text}”…"):
+        matches = load_matches(text)
+    if not matches:
+        st.error(f"Couldn't find a listed company matching “{text}”. Try a fuller name or the NSE symbol.")
+        return None
+
+    banner = st.empty()  # filled after the picker so it always reflects the chosen match
+    idx = 0
+    if len(matches) > 1:
+        idx = st.selectbox(
+            "Not the right company? Pick another match",
+            range(len(matches)), key=f"pick::{text.lower()}",
+            format_func=lambda i: f"{matches[i].name}  ·  {matches[i].symbol}",
+        )
+    m = matches[idx]
+    banner.markdown(f'<div class="match">🔎 “{escape(text)}” → <b>{escape(m.name)}</b> '
+                    f'<span class="sym">{escape(m.symbol)}</span></div>', unsafe_allow_html=True)
+    with st.spinner(f"Fetching filings for {m.symbol} from Screener.in…"):
+        return load_company(m.symbol, basis)
+
+
 # ----------------------------------------------------------------------------
 # Page
 # ----------------------------------------------------------------------------
@@ -539,20 +585,22 @@ def main() -> None:
     if not q:
         html(f"""
         <div class="grid-2">
-          {verdict_card("Step 1", "WATCHLIST", "Enter a symbol", "Type an NSE symbol (e.g. TCS) or a BSE code and press Analyse.", ["Screener.in", "Yahoo Finance"])}
+          {verdict_card("Step 1", "WATCHLIST", "Enter a company", "Type a company name (e.g. Shriram Finance) or an NSE symbol and press Analyse.", ["Screener.in", "Yahoo Finance"])}
           {verdict_card("Step 2", "VALID", "Read the verdicts", "MDSPORT scores quality growth out of 100; MPTDS checks four long-term uptrends.", ["MDSPORT", "MPTDS"])}
         </div>""")
         render_footer()
         return
 
     if not q["symbol"]:
-        st.warning("Please enter a symbol.")
+        st.warning("Please enter a company name or symbol.")
         render_footer()
         return
 
     try:
-        with st.spinner(f"Fetching filings for {q['symbol']} from Screener.in…"):
-            data = load_company(q["symbol"], q["basis"])
+        data = find_company(q["symbol"], q["basis"])
+        if data is None:
+            render_footer()
+            return
     except DataError as e:
         st.error(str(e))
         render_footer()
